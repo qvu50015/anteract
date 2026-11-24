@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import {test} from 'node:test';
+import {readFile} from 'node:fs/promises';
+const modulePath=process.env.DM_PGLITE_MODULE;
+test('custom-category migration preserves events and RLS while allowing bounded user labels',{skip:!modulePath},async()=>{
+ const {PGlite}=await import(modulePath);const db=new PGlite();
+ await db.exec(`create role anon;create role authenticated;create schema auth;
+ create table auth.users(id uuid primary key);create table public.profiles(id uuid primary key references auth.users(id));
+ create function auth.uid()returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;
+ create function auth.jwt()returns jsonb language sql stable as $$select jsonb_build_object('email',current_setting('request.jwt.claim.email',true))$$;
+ grant usage on schema public,auth to authenticated,anon;`);
+ await db.exec(await readFile(new URL('../supabase/migrations/202610240002_events.sql',import.meta.url),'utf8'));
+ const user='00000000-0000-4000-8000-000000000001';await db.query('insert into auth.users values($1)',[user]);await db.query('insert into profiles values($1)',[user]);
+ const insert=category=>db.query("insert into events(host_id,title,category,location,starts_at,description,capacity)values($1,'An event',$2,'Campus',now()+interval '1 day','A valid event description',5)returning id,category",[user,category]);
+ const original=(await insert('Study')).rows[0];await assert.rejects(insert('Gaming'));
+ const policies=(await db.query("select policyname,qual,with_check from pg_policies where tablename='events' order by policyname")).rows;
+ await db.exec(await readFile(new URL('../supabase/migrations/20261103200517_custom_event_categories.sql',import.meta.url),'utf8'));
+ assert.equal((await db.query('select category from events where id=$1',[original.id])).rows[0].category,'Study');
+ assert.deepEqual((await db.query("select policyname,qual,with_check from pg_policies where tablename='events' order by policyname")).rows,policies);
+ await db.query("select set_config('request.jwt.claim.sub',$1,false),set_config('request.jwt.claim.email','student@uci.edu',false)",[user]);await db.exec('set role authenticated');
+ assert.equal((await insert('Gaming')).rows[0].category,'Gaming');assert.equal((await insert('Arts & Crafts')).rows[0].category,'Arts & Crafts');
+ for(const category of ['', 'x', 'All', 'all', 'x'.repeat(41), ' Arts ', 'Bad\nCategory'])await assert.rejects(insert(category));
+ await assert.rejects(db.query("insert into events(host_id,title,category,location,starts_at,description,capacity)values($1,'An event','Gaming','Campus',now(),'A valid description',51)",[user]));
+ await db.close();
+});
